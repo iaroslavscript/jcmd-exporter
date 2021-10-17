@@ -6,7 +6,7 @@ build:
 	go build
 
 clean:
-	rm m
+	rm jcmd-exporter
 
 run: build
-	./m
+	./jcmd-exporter
