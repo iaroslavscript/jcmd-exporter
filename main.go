@@ -5,10 +5,13 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"os/exec"
+	"os/signal"
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -24,11 +27,12 @@ type metricLabelsMap map[string]metricAttr
 
 type metricMap map[string]prometheus.Gauge
 
+type signalHandler func(os.Signal) (bool, int)
+
 var optBindAddr = flag.String("listen-address", ":2112", "The address to listen on for HTTP requests.")
 var optMainClass = flag.String("main-class", "SingleThread", "The main class of Java application.")
 
 func NewMetricLabelsMap() *metricLabelsMap {
-
 	subsystem := "native_memory"
 
 	m := make(metricLabelsMap)
@@ -622,105 +626,54 @@ func parse_response(s string, p *regexp.Regexp, m *metricMap) {
 	}
 }
 
-func NewPattern() *regexp.Regexp {
+func regestrySignalHandler(handlers map[os.Signal]signalHandler) {
+	c := make(chan os.Signal, 1)
 
-	pattern := `(?ms)` +
+	signals := make([]os.Signal, 0, len(handlers))
 
-		// Total section (to_)
-		`^Total: reserved=(?P<to_resv_kb>\d+)KB, committed=(?P<to_comm_kb>\d+)KB.+` +
+	for k := range handlers {
+		signals = append(signals, k)
+	}
 
-		// Java Heap section (hp_)
-		`-\s+Java Heap \(reserved=(?P<hp_resv_kb>\d+)KB, committed=(?P<hp_comm_kb>\d+)KB\).+` +
-		`\(mmap: reserved=(?P<hp_mm_resv_kb>\d+)KB, committed=(?P<hp_mm_comm_kb>\d+)KB\).+` +
+	signal.Notify(c, signals...)
 
-		// Class section (cl_)
-		`-\s+Class \(reserved=(?P<cl_resv_kb>\d+)KB, committed=(?P<cl_comm_kb>\d+)KB\).+` +
-		`\(classes #(?P<cl_classes_total>\d+)\).+` +
-		`\(\s+instance classes #(?P<cl_ic_total>\d+), array classes #(?P<cl_ac_total>\d+)\).+` +
-		`\(malloc=(?P<cl_malloc_kb>\d+)KB #(?P<cl_malloc_total>\d+)\).+` +
-		`\(mmap: reserved=(?P<cl_mm_resv_kb>\d+)KB, committed=(?P<cl_mm_comm_kb>\d+)KB\).+` +
+	go func() {
+		for {
+			s := <-c
+			fmt.Printf("INFO cache signal %v\n", s)
 
-		// Class Metadata subsection (cl_me_)
-		`\(\s+reserved=(?P<cl_me_resv_kb>\d+)KB, committed=(?P<cl_me_comm_kb>\d+)KB\).+` +
-		`\(\s+used=(?P<cl_me_used_kb>\d+)KB\).+` +
-		`\(\s+free=(?P<cl_me_free_kb>\d+)KB\).+` +
-		`\(\s+waste=(?P<cl_me_waste_kb>\d+)KB =.+%\).+` +
+			if handler, ok := handlers[s]; ok {
 
-		// Class Class Space subsection (cl_cs_)
-		`\(\s+reserved=(?P<cl_cs_resv_kb>\d+)KB, committed=(?P<cl_cs_comm_kb>\d+)KB\).+` +
-		`\(\s+used=(?P<cl_cs_used_kb>\d+)KB\).+` +
-		`\(\s+free=(?P<cl_cs_free_kb>\d+)KB\).+` +
-		`\(\s+waste=(?P<cl_cs_waste_kb>\d+)KB =.+%\).+` +
+				exit_required, exit_code := handler(s)
+				if exit_required {
+					os.Exit(exit_code)
+				}
+			} else {
+				err := fmt.Errorf("got unknown signal %v", s)
+				fmt.Println(err.Error())
+				os.Exit(1)
+			}
+		}
+	}()
+}
 
-		// Thread section (th_)
-		`-\s+Thread\s+\(reserved=(?P<th_resv_kb>\d+)KB, committed=(?P<th_comm_kb>\d+)KB\).+` +
-		`\(thread #(?P<th_total>\d+)\).+` +
-		`\(stack: reserved=(?P<th_s_resv_kb>\d+)KB, committed=(?P<th_s_comm_kb>\d+)KB\).+` +
-		`\(malloc=(?P<th_malloc_kb>\d+)KB #(?P<th_malloc_total>\d+)\).+` +
-		`\(arena=(?P<th_arena_kb>\d+)KB #(?P<th_arena_total>\d+)\).+` +
+func cleanup(s os.Signal) (bool, int) {
+	return true, 0
+}
 
-		// Code section (co_)
-		`-\s+Code \(reserved=(?P<co_resv_kb>\d+)KB, committed=(?P<co_comm_kb>\d+)KB\).+` +
-		`\s+\(malloc=(?P<co_malloc_kb>\d+)KB #(?P<co_malloc_total>\d+)\).+` +
-		`\s+\(mmap: reserved=(?P<co_mm_resv_kb>\d+)KB, committed=(?P<co_mm_comm_kb>\d+)KB\).+` +
-
-		// GC section (gc_)
-		`-\s+GC \(reserved=(?P<gc_resv_kb>\d+)KB, committed=(?P<gc_comm_kb>\d+)KB\).+` +
-		`\s+\(malloc=(?P<gc_malloc_kb>\d+)KB #(?P<gc_malloc_total>\d+)\).+` +
-		`\s+\(mmap: reserved=(?P<gc_mm_resv_kb>\d+)KB, committed=(?P<gc_mm_comm_kb>\d+)KB\).+` +
-
-		// Compiler section (cp_)
-		`-\s+Compiler \(reserved=(?P<cp_resv_kb>\d+)KB, committed=(?P<cp_comm_kb>\d+)KB\).+` +
-		`\s+\(malloc=(?P<cp_malloc_kb>\d+)KB #(?P<cp_malloc_total>\d+)\).+` +
-		`\s+\(arena=(?P<cp_arena_kb>\d+)KB #(?P<cp_arena_total>\d+)\).+` +
-
-		// Internal section (in_)
-		`-\s+Internal \(reserved=(?P<in_resv_kb>\d+)KB, committed=(?P<in_comm_kb>\d+)KB\).+` +
-		`\s+\(malloc=(?P<in_malloc_kb>\d+)KB #(?P<in_malloc_total>\d+)\).+` +
-		`\s+\(mmap: reserved=(?P<in_mm_resv_kb>\d+)KB, committed=(?P<in_mm_comm_kb>\d+)KB\).+` +
-
-		// Symbol section (sy_)
-		`-\s+Symbol \(reserved=(?P<sy_resv_kb>\d+)KB, committed=(?P<sy_comm_kb>\d+)KB\).+` +
-		`\s+\(malloc=(?P<sy_malloc_kb>\d+)KB #(?P<sy_malloc_total>\d+)\).+` +
-		`\s+\(arena=(?P<sy_arena_kb>\d+)KB #(?P<sy_arena_total>\d+)\).+` +
-
-		// Native Memory Tracking section (nm_)
-		`-\s+Native Memory Tracking \(reserved=(?P<nm_resv_kb>\d+)KB, committed=(?P<nm_comm_kb>\d+)KB\).+` +
-		`\s+\(malloc=(?P<nm_malloc_kb>\d+)KB #(?P<nm_malloc_total>\d+)\).+` +
-		`\s+\(tracking overhead=(?P<nm_overhead_kb>\d+)KB\).+` +
-
-		// Shared Class Space section (sc_)
-		`-\s+Shared class space \(reserved=(?P<sc_resv_kb>\d+)KB, committed=(?P<sc_comm_kb>\d+)KB\).+` +
-		`\s+\(mmap: reserved=(?P<sc_mm_resv_kb>\d+)KB, committed=(?P<sc_mm_comm_kb>\d+)KB\).+` +
-
-		// Arena Chunk section (ac_)
-		`-\s+Arena Chunk \(reserved=(?P<ac_resv_kb>\d+)KB, committed=(?P<ac_comm_kb>\d+)KB\).+` +
-		`\s+\(malloc=(?P<ac_malloc_kb>\d+)KB\).+` +
-
-		// Logging section (lo_)
-		`-\s+Logging \(reserved=(?P<lo_resv_kb>\d+)KB, committed=(?P<lo_comm_kb>\d+)KB\).+` +
-		`\s+\(malloc=(?P<lo_malloc_kb>\d+)KB #(?P<lo_malloc_total>\d+)\).+` +
-
-		// Arguments section (ar_)
-		`-\s+Arguments \(reserved=(?P<ar_resv_kb>\d+)KB, committed=(?P<ar_comm_kb>\d+)KB\).+` +
-		`\s+\(malloc=(?P<ar_malloc_kb>\d+)KB #(?P<ar_malloc_total>\d+)\).+` +
-
-		// Module section (mo_)
-		`-\s+Module \(reserved=(?P<mo_resv_kb>\d+)KB, committed=(?P<mo_comm_kb>\d+)KB\).+` +
-		`\s+\(malloc=(?P<mo_malloc_kb>\d+)KB #(?P<mo_malloc_total>\d+)\).+` +
-
-		// Safepoint section (sp_)
-		`-\s+Safepoint \(reserved=(?P<sp_resv_kb>\d+)KB, committed=(?P<sp_comm_kb>\d+)KB\).+` +
-		`\s+\(mmap: reserved=(?P<sp_mm_resv_kb>\d+)KB, committed=(?P<sp_mm_comm_kb>\d+)KB\).+` +
-
-		// Synchronization section (sn_)
-		`-\s+Synchronization \(reserved=(?P<sn_resv_kb>\d+)KB, committed=(?P<sn_comm_kb>\d+)KB\).+` +
-		`\s+\(malloc=(?P<sn_malloc_kb>\d+)KB #(?P<sn_malloc_total>\d+)\)`
-
-	return regexp.MustCompile(pattern)
+func reloadConfig(s os.Signal) (bool, int) {
+	return true, 0
 }
 
 func main() {
+
+	regestrySignalHandler(map[os.Signal]signalHandler{
+		syscall.SIGINT:  cleanup,
+		syscall.SIGTERM: cleanup,
+		syscall.SIGHUP:  reloadConfig,
+	})
+
+	flag.Parse()
 
 	metrics := NewMetricMap(NewMetricLabelsMap())
 	pattern := NewPattern()
@@ -729,7 +682,6 @@ func main() {
 
 	parse_response(stdout, pattern, metrics)
 
-	flag.Parse()
 	http.Handle("/metrics", promhttp.Handler())
 	log.Fatal(http.ListenAndServe(*optBindAddr, nil))
 }
