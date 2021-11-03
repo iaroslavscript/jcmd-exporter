@@ -667,6 +667,15 @@ func reloadConfig(s os.Signal) (bool, int) {
 
 func main() {
 
+	for _, value := range *NewMetricLabelsMap() {
+		fmt.Printf("{\n\t\"help\": \"%s\",\n\t\"name\": \"%s\",\n\t\"regex_group\": \"%s\"\n}\n",
+			value.help,
+			value.name,
+			value.reGroup,
+		)
+	}
+	os.Exit(0)
+
 	regestrySignalHandler(map[os.Signal]signalHandler{
 		syscall.SIGINT:  cleanup,
 		syscall.SIGTERM: cleanup,
