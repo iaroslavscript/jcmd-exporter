@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -12,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -27,15 +30,12 @@ type metricLabelsMap map[string]metricAttr
 
 type metricMap map[string]prometheus.Gauge
 
-type signalHandler func(os.Signal) (bool, int)
-
 var optBindAddr = flag.String("listen-address", ":2112", "The address to listen on for HTTP requests.")
-var optMainClass = flag.String("main-class", "SingleThread", "The main class of Java application.")
 
 func NewMetricLabelsMap() *metricLabelsMap {
 	subsystem := "native_memory"
 
-	m := make(metricLabelsMap)
+	m := make(metricLabelsMap) // TODO we know size
 
 	// Total Section (to_)
 	m[subsystem+"total_reserved_bytes"] = metricAttr{
@@ -581,19 +581,17 @@ func NewMetricMap(m *metricLabelsMap) *metricMap {
 	return &mm
 }
 
-func call_jcmd(mainClass string) string {
-	app := "jcmd"
-	arg1 := "VM.native_memory"
+func call_jcmd(ctx context.Context, app string, mainClass string, arg1 string) (string, error) {
 
-	cmd := exec.Command(app, mainClass, arg1)
+	cmd := exec.CommandContext(ctx, app, mainClass, arg1)
 	stdout, err := cmd.Output()
 
 	if err != nil {
 		fmt.Println(err.Error())
-		return ""
+		return "", err
 	}
 
-	return string(stdout)
+	return string(stdout), nil
 }
 
 func parse_response(s string, p *regexp.Regexp, m *metricMap) {
@@ -657,31 +655,130 @@ func regestrySignalHandler(handlers map[os.Signal]signalHandler) {
 	}()
 }
 
-func cleanup(s os.Signal) (bool, int) {
-	return true, 0
+func NewCmdTicker() {
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	done := make(chan bool)
+
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case t := <-ticker.C:
+				fmt.Println("Tick at", t)
+				/*stdout := call_jcmd(*optMainClass)
+
+				parse_response(stdout, pattern, metrics)*/
+			}
+		}
+	}()
+
 }
 
-func reloadConfig(s os.Signal) (bool, int) {
-	return true, 0
+func getConfig() *ApplicationConfig {
+
+	flag.Parse()
+
+	return &ApplicationConfig{}
+}
+
+func getTasks(cfg *ApplicationConfig) []*JcmdTask {
+	var result []*JcmdTask
+
+	_ = cfg // TODO fix me
+
+	result = append(result, &JcmdTask{
+		PathJcmd:     "jcmd",
+		PathExtaArgs: "",
+		MainClass:    "SingleThread",
+		SubSystem:    "VM.native_memory",
+		TimerMs:      1000,
+		TimeoutMs:    10000,
+		Metrics:      NewMetricMap(NewMetricLabelsMap()),
+	})
+
+	return result
+}
+
+func runTasks(ctx context.Context, p *regexp.Regexp, tasks []*JcmdTask) {
+
+	for i := range tasks {
+		go func(task *JcmdTask) error {
+
+			ticker := time.NewTicker(500 * time.Millisecond)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-ctx.Done():
+					return ctx.Err() // TODO do we need to return error in goroutine?
+				case t := <-ticker.C:
+					fmt.Println("Tick at", t)
+					timeout_ctx, close := context.WithTimeout(ctx, time.Duration(task.TimeoutMs)*time.Millisecond)
+					output, err := call_jcmd(timeout_ctx, task.PathJcmd, task.MainClass, task.SubSystem)
+
+					parse_response(output, p, task.Metrics)
+
+					fmt.Println("Finished", t)
+					close()
+				}
+			}
+		}(tasks[i])
+	}
 }
 
 func main() {
 
+	cfg := getConfig()
+
+	var srv http.Server
+
+	//pattern := NewPattern()
+
+	app := NewApplication(context.Background())
+
 	regestrySignalHandler(map[os.Signal]signalHandler{
-		syscall.SIGINT:  cleanup,
-		syscall.SIGTERM: cleanup,
-		syscall.SIGHUP:  reloadConfig,
+		syscall.SIGINT:  app.terminate,
+		syscall.SIGTERM: app.cleanup,
+		syscall.SIGHUP:  app.reloadConfig,
 	})
 
-	flag.Parse()
+	tasks := getTasks(cfg)
+	runTasks(app.ctx, tasks)
 
-	metrics := NewMetricMap(NewMetricLabelsMap())
-	pattern := NewPattern()
+	ln, err := net.Listen("tcp", ":8080")
+	if err != nil {
+		log.Fatal("Cannot create listener")
+	}
 
-	stdout := call_jcmd(*optMainClass)
-
-	parse_response(stdout, pattern, metrics)
-
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
+		// The "/" pattern matches everything, so we need to check
+		// that we're at the root here.
+		if req.URL.Path != "/" {
+			http.NotFound(w, req)
+			return
+		}
+		fmt.Fprintf(w, "HELLO from SRV\n")
+	})
 	http.Handle("/metrics", promhttp.Handler())
-	log.Fatal(http.ListenAndServe(*optBindAddr, nil))
+
+	server_error := make(chan error, 1)
+	go func() {
+		srv = http.Server{
+			Handler: mux,
+		}
+		log.Println("Server A started")
+		err := srv.Serve(ln)
+		log.Println("Server A stopped")
+		server_error <- err
+	}()
+
+	select {
+	case <-app.ctx.Done():
+		log.Printf("Application context done")
+	case err := <-server_error:
+		log.Printf("Server error %v", err.Error())
+	}
 }
