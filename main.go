@@ -91,6 +91,30 @@ func main() {
 	tasks := make([]*JcmdTask, 0)
 	RunTasks(app.ctx, pattern, tasks)
 
-	http.Handle("/metrics", promhttp.Handler())
-	log.Fatal(http.ListenAndServe(*optBindAddr, nil))
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+
+	server_error := make(chan error, 1)
+	go func() {
+		app.srv.Addr = *optBindAddr
+		app.srv.Handler = mux
+
+		server_error <- app.srv.ListenAndServe()
+	}()
+
+	for {
+		select {
+		case <-app.ctx.Done():
+			// TODO should we call srv.ShutDown here ???
+			log.Printf("Application context done")
+			os.Exit(1)
+		case err := <-server_error:
+			// if app in shutdown process we just wait for app context done
+			if !app.inShutdown {
+				log.Printf("Server error %v", err.Error())
+				os.Exit(1)
+			}
+		}
+	}
+
 }
