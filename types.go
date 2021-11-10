@@ -21,6 +21,16 @@ type Metric struct {
 	// TODO labels set
 }
 
+type JcmdTask struct {
+	PathJcmd     string
+	PathExtaArgs string // TODO
+	MainClass    string
+	SubSystem    string
+	TimerMs      int
+	TimeoutMs    int
+	Metrics      *metricsMap
+}
+
 type metricsMap map[string]Metric
 
 type signalHandler func(os.Signal) (bool, int)

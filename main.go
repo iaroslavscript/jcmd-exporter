@@ -1,12 +1,12 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"regexp"
 	"syscall"
@@ -16,21 +16,6 @@ import (
 
 var optBindAddr = flag.String("listen-address", ":2112", "The address to listen on for HTTP requests.")
 var optMainClass = flag.String("main-class", "SingleThread", "The main class of Java application.")
-
-func call_jcmd(mainClass string) string {
-	app := "jcmd"
-	arg1 := "VM.native_memory"
-
-	cmd := exec.Command(app, mainClass, arg1)
-	stdout, err := cmd.Output()
-
-	if err != nil {
-		log.Println(err.Error())
-		return ""
-	}
-
-	return string(stdout)
-}
 
 func parse_response(s string, p *regexp.Regexp, m *metricsMap) {
 
@@ -88,30 +73,23 @@ func regestrySignalHandler(handlers map[os.Signal]signalHandler) {
 	}()
 }
 
-func cleanup(s os.Signal) (bool, int) {
-	return true, 0
-}
-
-func reloadConfig(s os.Signal) (bool, int) {
-	return true, 0
-}
-
 func main() {
-
-	regestrySignalHandler(map[os.Signal]signalHandler{
-		syscall.SIGINT:  cleanup,
-		syscall.SIGTERM: cleanup,
-		syscall.SIGHUP:  reloadConfig,
-	})
 
 	flag.Parse()
 
-	metrics := NewMetricsMap(ParseMetricDescJson([]byte(DEFAULT_METRICS_JSON)))
+	app := NewApplication(context.Background())
+
+	regestrySignalHandler(map[os.Signal]signalHandler{
+		syscall.SIGINT:  app.terminate,
+		syscall.SIGTERM: app.cleanup,
+		syscall.SIGHUP:  app.reloadConfig,
+	})
+
+	_ = NewMetricsMap(ParseMetricDescJson([]byte(DEFAULT_METRICS_JSON)))
 	pattern := regexp.MustCompile(DEFAULT_REGEX_PATTERN)
 
-	stdout := call_jcmd(*optMainClass)
-
-	parse_response(stdout, pattern, metrics)
+	tasks := make([]*JcmdTask, 0)
+	RunTasks(app.ctx, pattern, tasks)
 
 	http.Handle("/metrics", promhttp.Handler())
 	log.Fatal(http.ListenAndServe(*optBindAddr, nil))
