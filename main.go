@@ -14,8 +14,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+var optConfigPath = flag.String("config", "", "The path to config file.")
 var optBindAddr = flag.String("listen-address", ":2112", "The address to listen on for HTTP requests.")
-var optMainClass = flag.String("main-class", "SingleThread", "The main class of Java application.")
 
 func parse_response(s string, p *regexp.Regexp, m *metricsMap) {
 
